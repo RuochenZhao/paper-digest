@@ -38,58 +38,65 @@ MIN_UPVOTES = 5   # filter out very low-signal papers
 # ── Scraping ──────────────────────────────────────────────────────────────────
 
 def fetch_hf_papers(url: str) -> list[dict]:
-    """Scrape paper cards from a HuggingFace papers page."""
+    """Scrape paper IDs from a HuggingFace papers page, then enrich via HF API."""
     headers = {"User-Agent": "Mozilla/5.0 (research-bot/1.0)"}
     resp = requests.get(url, headers=headers, timeout=20)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    papers = []
+    arxiv_ids = []
     seen = set()
-
-    # Each paper card is an <article> or an <h3> inside a card — HF uses <h3> titles
-    for h3 in soup.find_all("h3"):
-        a = h3.find("a", href=True)
-        if not a:
-            continue
+    for a in soup.find_all("a", href=True):
         href = a["href"]
-        if not href.startswith("/papers/"):
-            continue
-        arxiv_id = href.replace("/papers/", "").strip()
-        if arxiv_id in seen:
-            continue
-        seen.add(arxiv_id)
+        if href.startswith("/papers/") and href.count("/") == 2:
+            arxiv_id = href.replace("/papers/", "").strip()
+            if arxiv_id and arxiv_id not in seen:
+                seen.add(arxiv_id)
+                arxiv_ids.append(arxiv_id)
 
-        title = a.get_text(strip=True)
-
-        # Abstract / blurb — sibling <p> near the card
-        blurb = ""
-        parent = h3.find_parent()
-        if parent:
-            p = parent.find("p")
-            if p:
-                blurb = p.get_text(strip=True)
-
-        # Upvotes — look for upvote count text nearby
-        upvotes = 0
-        card = h3.find_parent("div") or h3.find_parent("article")
-        if card:
-            for btn in card.find_all(string=re.compile(r"Upvote\s+\d+")):
-                m = re.search(r"(\d+)", btn)
-                if m:
-                    upvotes = int(m.group(1))
-                    break
-
-        papers.append({
-            "arxiv_id": arxiv_id,
-            "title": title,
-            "blurb": blurb,
-            "upvotes": upvotes,
-            "hf_url": f"https://huggingface.co/papers/{arxiv_id}",
-            "arxiv_url": f"https://arxiv.org/abs/{arxiv_id}",
-        })
+    papers = []
+    for arxiv_id in arxiv_ids:
+        paper = fetch_hf_paper_api(arxiv_id)
+        if paper:
+            papers.append(paper)
+        time.sleep(0.1)  # be polite
 
     return papers
+
+
+def fetch_hf_paper_api(arxiv_id: str) -> dict | None:
+    """Fetch paper metadata including upvotes from HF API."""
+    url = f"https://huggingface.co/api/papers/{arxiv_id}"
+    try:
+        resp = requests.get(url, timeout=10)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        
+        # Extract institution from authors if available
+        institution = ""
+        authors = data.get("authors", [])
+        if authors:
+            # HF API sometimes includes affiliations
+            affiliations = []
+            for author in authors[:3]:  # check first 3 authors
+                aff = author.get("affiliations", [])
+                if aff:
+                    affiliations.extend(aff)
+            if affiliations:
+                institution = affiliations[0] if isinstance(affiliations[0], str) else ""
+
+        return {
+            "arxiv_id": arxiv_id,
+            "title": data.get("title", ""),
+            "blurb": data.get("summary", data.get("abstract", "")),
+            "upvotes": data.get("upvotes", 0),
+            "institution": institution,
+            "hf_url": f"https://huggingface.co/papers/{arxiv_id}",
+            "arxiv_url": f"https://arxiv.org/abs/{arxiv_id}",
+        }
+    except Exception:
+        return None
 
 
 def is_relevant(paper: dict) -> bool:
@@ -120,8 +127,10 @@ def summarise_papers(papers: list[dict]) -> str:
 
     paper_list = ""
     for i, p in enumerate(papers, 1):
+        inst_line = f"    Institution: {p['institution']}\n" if p.get("institution") else ""
         paper_list += (
             f"[{i}] Title: {p['title']}\n"
+            f"{inst_line}"
             f"    HF Upvotes: {p['upvotes']}\n"
             f"    Abstract: {p['blurb']}\n"
             f"    HF: {p['hf_url']}\n"
@@ -141,20 +150,19 @@ Below are candidate papers scraped from HuggingFace Papers (trending + daily).
 Please:
 1. Select the TOP 5-8 most relevant and high-quality papers for her interests.
    Prioritise novelty, rigour, and direct relevance. Exclude peripheral or low-quality work.
-2. For each selected paper, write:
-   - A 3-sentence summary in English (what problem, what method, key result)
-   - One sentence on why it's relevant to her research
-   - Quality signal (upvotes, institution if inferable)
-3. Output as a clean digest, no markdown tables, use emoji sparingly.
-   Format each entry exactly like:
+2. For each selected paper, write a compact entry. Keep the summary to 2 sentences max
+   (one sentence on problem/method, one on key result). Be concise and precise.
+   Include institution only if clearly stated in the paper metadata — skip if uncertain.
+3. Output as a clean digest. Format each entry exactly like:
 
 📄 *Title*
-Summary: ...
-Relevance: ...
-🔗 HF: <url> | arXiv: <url>
+🏛 Institution (omit this line if unknown)
+Summary: <2 sentences>
+Relevance: <1 sentence>
+🔗 HF: <hf_url> | arXiv: <arxiv_url>
 👍 <upvotes> upvotes
 
-End with a one-paragraph "Big Picture" noting any themes or trends across today's papers.
+End with a 2-sentence "Big Picture" on any trends across today's papers.
 
 PAPERS:
 {paper_list}
