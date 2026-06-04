@@ -29,18 +29,68 @@ TOPICS = [
 ]
 
 SOURCES = [
-    "https://huggingface.co/papers",          # daily
-    "https://huggingface.co/papers/trending", # trending
+    "https://huggingface.co/api/daily_papers",  # daily (official API)
+    "https://huggingface.co/papers/trending",   # trending (scraped)
 ]
 
 MIN_UPVOTES = 5   # filter out very low-signal papers
 
+MAX_RETRIES = 4
+RETRY_BACKOFF = 2  # seconds, doubled each attempt
+
 # ── Scraping ──────────────────────────────────────────────────────────────────
 
+def _get_with_retry(url: str, **kwargs) -> requests.Response:
+    """GET with exponential backoff on 429."""
+    delay = RETRY_BACKOFF
+    for attempt in range(MAX_RETRIES):
+        resp = requests.get(url, **kwargs)
+        if resp.status_code != 429:
+            return resp
+        print(f"  429 on {url}, retrying in {delay}s (attempt {attempt+1}/{MAX_RETRIES})")
+        time.sleep(delay)
+        delay *= 2
+    resp.raise_for_status()
+    return resp
+
+
 def fetch_hf_papers(url: str) -> list[dict]:
+    """Fetch papers from a HuggingFace source (API or scraped page)."""
+    if url.startswith("https://huggingface.co/api/"):
+        return _fetch_hf_daily_api(url)
+    return _fetch_hf_scraped(url)
+
+
+def _fetch_hf_daily_api(url: str) -> list[dict]:
+    """Fetch daily papers from the official HF API (returns JSON directly)."""
+    headers = {"User-Agent": "Mozilla/5.0 (research-bot/1.0)"}
+    resp = _get_with_retry(url, headers=headers, timeout=20)
+    resp.raise_for_status()
+    data = resp.json()
+
+    papers = []
+    for item in data:
+        p = item.get("paper", item)  # API wraps paper under "paper" key
+        arxiv_id = p.get("id", "")
+        if not arxiv_id:
+            continue
+        institution = _extract_institution(p.get("authors", []))
+        papers.append({
+            "arxiv_id": arxiv_id,
+            "title": p.get("title", ""),
+            "blurb": p.get("summary", p.get("abstract", "")),
+            "upvotes": item.get("upvotes", p.get("upvotes", 0)),
+            "institution": institution,
+            "hf_url": f"https://huggingface.co/papers/{arxiv_id}",
+            "arxiv_url": f"https://arxiv.org/abs/{arxiv_id}",
+        })
+    return papers
+
+
+def _fetch_hf_scraped(url: str) -> list[dict]:
     """Scrape paper IDs from a HuggingFace papers page, then enrich via HF API."""
     headers = {"User-Agent": "Mozilla/5.0 (research-bot/1.0)"}
-    resp = requests.get(url, headers=headers, timeout=20)
+    resp = _get_with_retry(url, headers=headers, timeout=20)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -59,9 +109,20 @@ def fetch_hf_papers(url: str) -> list[dict]:
         paper = fetch_hf_paper_api(arxiv_id)
         if paper:
             papers.append(paper)
-        time.sleep(0.1)  # be polite
+        time.sleep(0.3)  # be polite
 
     return papers
+
+
+def _extract_institution(authors: list) -> str:
+    affiliations = []
+    for author in authors[:3]:
+        aff = author.get("affiliations", [])
+        if aff:
+            affiliations.extend(aff)
+    if affiliations:
+        return affiliations[0] if isinstance(affiliations[0], str) else ""
+    return ""
 
 
 def fetch_hf_paper_api(arxiv_id: str) -> dict | None:
@@ -72,26 +133,12 @@ def fetch_hf_paper_api(arxiv_id: str) -> dict | None:
         if resp.status_code != 200:
             return None
         data = resp.json()
-        
-        # Extract institution from authors if available
-        institution = ""
-        authors = data.get("authors", [])
-        if authors:
-            # HF API sometimes includes affiliations
-            affiliations = []
-            for author in authors[:3]:  # check first 3 authors
-                aff = author.get("affiliations", [])
-                if aff:
-                    affiliations.extend(aff)
-            if affiliations:
-                institution = affiliations[0] if isinstance(affiliations[0], str) else ""
-
         return {
             "arxiv_id": arxiv_id,
             "title": data.get("title", ""),
             "blurb": data.get("summary", data.get("abstract", "")),
             "upvotes": data.get("upvotes", 0),
-            "institution": institution,
+            "institution": _extract_institution(data.get("authors", [])),
             "hf_url": f"https://huggingface.co/papers/{arxiv_id}",
             "arxiv_url": f"https://arxiv.org/abs/{arxiv_id}",
         }
